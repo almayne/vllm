@@ -13,8 +13,10 @@ if not has_helion():
         allow_module_level=True,
     )
 
+from vllm.kernels.helion.case_key import CaseKey
 from vllm.kernels.helion.config_manager import ConfigManager
 from vllm.kernels.helion.ops.silu_mul_fp8 import (
+    _pick_cache,
     pick_silu_mul_fp8_config,
     silu_mul_fp8,
     silu_mul_fp8_baseline,
@@ -52,10 +54,13 @@ def reset_config_manager_singleton():
 
 
 class TestSiluMulFp8ConfigPicker:
+    def setup_method(self):
+        _pick_cache.clear()
+
     def test_config_picker_exact_match(self):
         config_keys = [
-            "intermediate_2048_batchsize_256",
-            "intermediate_4096_batchsize_256",
+            CaseKey({"intermediate": 2048, "numtokens": 256}),
+            CaseKey({"intermediate": 4096, "numtokens": 256}),
         ]
 
         input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
@@ -63,33 +68,22 @@ class TestSiluMulFp8ConfigPicker:
         args = (input_tensor, scale)
 
         selected_key = pick_silu_mul_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_2048_batchsize_256"
+        assert selected_key == CaseKey({"intermediate": 2048, "numtokens": 256})
 
     def test_config_picker_closest_match(self):
         config_keys = [
-            "intermediate_2048_batchsize_256",
-            "intermediate_4096_batchsize_256",
+            CaseKey({"intermediate": 2048, "numtokens": 256}),
+            CaseKey({"intermediate": 4096, "numtokens": 256}),
         ]
-        # Use 7000 (intermediate_size=3500) which is closer to 4096 than 2048
         input_tensor = torch.randn(32, 7000, dtype=torch.bfloat16, device="cuda")
         scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
         args = (input_tensor, scale)
 
         selected_key = pick_silu_mul_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_batchsize_256"
-
-    def test_config_picker_fallback_to_default(self):
-        config_keys = ["default", "some_other_key"]
-
-        input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
-        scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
-        args = (input_tensor, scale)
-
-        selected_key = pick_silu_mul_fp8_config(args, config_keys)
-        assert selected_key == "default"
+        assert selected_key == CaseKey({"intermediate": 4096, "numtokens": 256})
 
     def test_config_picker_no_configs(self):
-        config_keys: list[str] = []
+        config_keys: list[dict] = []
 
         input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
         scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
@@ -101,9 +95,9 @@ class TestSiluMulFp8ConfigPicker:
     @pytest.mark.parametrize("intermediate_size", [2048, 4096, 5120])
     def test_config_picker_different_sizes(self, intermediate_size):
         config_keys = [
-            "intermediate_2048_batchsize_256",
-            "intermediate_4096_batchsize_256",
-            "intermediate_5120_batchsize_256",
+            CaseKey({"intermediate": 2048, "numtokens": 256}),
+            CaseKey({"intermediate": 4096, "numtokens": 256}),
+            CaseKey({"intermediate": 5120, "numtokens": 256}),
         ]
 
         input_tensor = torch.randn(
@@ -113,8 +107,47 @@ class TestSiluMulFp8ConfigPicker:
         args = (input_tensor, scale)
 
         selected_key = pick_silu_mul_fp8_config(args, config_keys)
-        expected_key = f"intermediate_{intermediate_size}_batchsize_256"
-        assert selected_key == expected_key
+        assert selected_key == {
+            "intermediate": intermediate_size,
+            "numtokens": 256,
+        }
+
+    def test_config_picker_numtokens_ceiling(self):
+        config_keys = [
+            CaseKey({"intermediate": 4096, "numtokens": 8}),
+            CaseKey({"intermediate": 4096, "numtokens": 32}),
+            CaseKey({"intermediate": 4096, "numtokens": 128}),
+            CaseKey({"intermediate": 4096, "numtokens": 256}),
+        ]
+        input_tensor = torch.randn(20, 8192, dtype=torch.bfloat16, device="cuda")
+        scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+        selected_key = pick_silu_mul_fp8_config((input_tensor, scale), config_keys)
+        assert selected_key == CaseKey({"intermediate": 4096, "numtokens": 32})
+
+    def test_config_picker_numtokens_exact(self):
+        config_keys = [
+            CaseKey({"intermediate": 4096, "numtokens": 8}),
+            CaseKey({"intermediate": 4096, "numtokens": 32}),
+            CaseKey({"intermediate": 4096, "numtokens": 128}),
+        ]
+        input_tensor = torch.randn(32, 8192, dtype=torch.bfloat16, device="cuda")
+        scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+        selected_key = pick_silu_mul_fp8_config((input_tensor, scale), config_keys)
+        assert selected_key == CaseKey({"intermediate": 4096, "numtokens": 32})
+
+    def test_config_picker_numtokens_fallback_to_largest(self):
+        config_keys = [
+            CaseKey({"intermediate": 4096, "numtokens": 8}),
+            CaseKey({"intermediate": 4096, "numtokens": 32}),
+            CaseKey({"intermediate": 4096, "numtokens": 128}),
+        ]
+        input_tensor = torch.randn(512, 8192, dtype=torch.bfloat16, device="cuda")
+        scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+        selected_key = pick_silu_mul_fp8_config((input_tensor, scale), config_keys)
+        assert selected_key == CaseKey({"intermediate": 4096, "numtokens": 128})
 
 
 class TestSiluMulFp8Correctness:

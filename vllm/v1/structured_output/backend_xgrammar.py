@@ -10,8 +10,8 @@ import torch
 import vllm.envs
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.utils.import_utils import LazyLoader
+from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -19,6 +19,7 @@ from vllm.v1.structured_output.backend_types import (
 )
 from vllm.v1.structured_output.utils import (
     choice_as_grammar,
+    compile_regex_with_timeout,
     convert_lark_to_ebnf,
     grammar_is_likely_lark,
 )
@@ -38,7 +39,7 @@ class XgrammarBackend(StructuredOutputBackend):
             self.vllm_config.structured_outputs_config.disable_any_whitespace
         )
 
-        if isinstance(self.tokenizer, MistralTokenizer):
+        if is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
             # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
             stop_token_ids = [self.tokenizer.eos_token_id]
@@ -88,7 +89,10 @@ class XgrammarBackend(StructuredOutputBackend):
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)
         elif request_type == StructuredOutputOptions.REGEX:
-            ctx = self.compiler.compile_regex(grammar_spec)
+            ctx = compile_regex_with_timeout(
+                self.compiler.compile_regex,
+                grammar_spec,
+            )
         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
             s_tag = json.loads(grammar_spec)
             if "structures" in s_tag:
@@ -277,7 +281,10 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
 
     if so_params.regex:
         try:
-            xgr.Grammar.from_regex(so_params.regex)
+            compile_regex_with_timeout(
+                xgr.Grammar.from_regex,
+                so_params.regex,
+            )
         except Exception as err:
             raise ValueError(
                 f"Failed to transform regex into a grammar: {err}"
@@ -289,7 +296,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             xgr.Grammar.from_ebnf(choice_grammar)
         except Exception as err:
             raise ValueError(
-                "Failed to transform choices into a grammar: {err}"
+                f"Failed to transform choices into a grammar: {err}"
             ) from err
         so_params.choice = None
         so_params.grammar = choice_grammar

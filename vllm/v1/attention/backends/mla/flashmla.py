@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -17,10 +18,9 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -48,6 +48,7 @@ class FlashMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
+        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
@@ -56,6 +57,14 @@ class FlashMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64]
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (1, 0, 2, 3)
+        return (0, 1, 2)
 
     @staticmethod
     def get_name() -> str:
@@ -79,10 +88,11 @@ class FlashMLABackend(MLACommonBackend):
         head_size: int,
         dtype: torch.dtype,
         kv_cache_dtype: CacheDType | None,
-        block_size: int,
+        block_size: int | None,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         if use_sparse:
@@ -128,10 +138,11 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
         self.cg_buf_tile_scheduler_metadata = None
         self.cg_buf_num_splits = None
-        self.is_fp8_kvcache = vllm_config.cache_config.cache_dtype.startswith("fp8")
+        self.is_fp8_kvcache = is_quantized_kv_cache(
+            vllm_config.cache_config.cache_dtype
+        )
 
-        device_properties = torch.cuda.get_device_properties(self.device)
-        num_sms = device_properties.multi_processor_count
+        num_sms = num_compute_units(self.device.index)
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.cg_buf_tile_scheduler_metadata = torch.zeros(
@@ -173,6 +184,21 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 num_q_tokens_per_head_k,
                 1,  # MQA for the decode path
             )
+
+            # Copy FP8 metadata into persistent CUDA graph buffers
+            if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                assert self.cg_buf_tile_scheduler_metadata is not None
+                assert self.cg_buf_num_splits is not None
+                n = tile_scheduler_metadata.size(0)
+                assert n <= self.cg_buf_tile_scheduler_metadata.size(0)
+                self.cg_buf_tile_scheduler_metadata[:n].copy_(tile_scheduler_metadata)
+                tile_scheduler_metadata = self.cg_buf_tile_scheduler_metadata[:n]
+
+                n = num_splits.size(0)
+                assert n <= self.cg_buf_num_splits.size(0)
+                self.cg_buf_num_splits[:n].copy_(num_splits)
+                num_splits = self.cg_buf_num_splits[:n]
+
             scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
             scheduler_metadata.num_splits = num_splits
 
@@ -255,7 +281,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         q = reshape_query_for_spec_decode(q, num_decodes)
 
         scheduler_metadata = attn_metadata.decode.scheduler_metadata
-        if vllm_is_batch_invariant() and not self.kv_cache_dtype.startswith("fp8"):
+        if envs.VLLM_BATCH_INVARIANT and not is_quantized_kv_cache(self.kv_cache_dtype):
             device = q.device
             dtype = torch.int32
 
@@ -285,7 +311,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
             scheduler_metadata.num_splits = num_splits
 
-        if self.kv_cache_dtype.startswith("fp8"):
+        if is_quantized_kv_cache(self.kv_cache_dtype):
             o, lse = flash_mla_with_kvcache_fp8(
                 q=q,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1

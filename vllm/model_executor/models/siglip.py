@@ -18,6 +18,7 @@ from transformers import (
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.inputs import MultiModalDataDict, MultiModalInput
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import (
     EncoderOnlyAttention,
@@ -38,20 +39,23 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
-    MultiModalInputs,
     MultiModalKwargsItems,
-    MultiModalUUIDDict,
 )
-from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageProcessorItems,
+    ImageSize,
+    MultiModalDataItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
+    ProcessorInputs,
     PromptIndexTargets,
     PromptReplacement,
     PromptUpdate,
+    TimingContext,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -154,14 +158,13 @@ class SiglipDummyInputsBuilder(BaseDummyInputsBuilder[SiglipProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-        mm_processor_kwargs: Mapping[str, object] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
 
         target_width, target_height = self.info.get_image_size_with_most_features()
 
-        image_overrides = mm_options.get("image") if mm_options else None
+        image_overrides = mm_options.get("image")
 
         return {
             "image": self._get_dummy_images(
@@ -187,24 +190,20 @@ class SiglipMultiModalProcessor(BaseMultiModalProcessor[SiglipProcessingInfo]):
 
     def apply(
         self,
-        prompt: str | list[int],
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object] | None = None,
-        *,
-        mm_uuids: MultiModalUUIDDict | None = None,
-    ) -> MultiModalInputs:
-        if mm_items:
-            if isinstance(prompt, str):
-                if len(prompt) > 0:
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput:
+        if inputs.mm_data_items:
+            if isinstance(inputs.prompt, str):
+                if len(inputs.prompt) > 0:
                     raise ValueError(
                         "SigLIP accepts text-only or image-only inputs, not both! "
                         "You must pass an image with an empty text prompt."
                     )
             else:
                 special_tokens = self.info.get_tokenizer().all_special_ids
-                if all(tok in special_tokens for tok in prompt):
-                    prompt = []
+                if all(tok in special_tokens for tok in inputs.prompt):
+                    inputs.prompt = []
                 else:
                     raise ValueError(
                         "SigLIP accepts text-only or image-only inputs, not both! "
@@ -212,19 +211,13 @@ class SiglipMultiModalProcessor(BaseMultiModalProcessor[SiglipProcessingInfo]):
                     )
 
             # For multi-modal data, the prompt after processing should
-            # only contain the image token
-            tokenization_kwargs = {
-                **(tokenization_kwargs or {}),
+            # only contain the dummy image tokens
+            inputs.tokenization_kwargs = {
+                **inputs.tokenization_kwargs,
                 "add_special_tokens": False,
             }
 
-        return super().apply(
-            prompt=prompt,
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+        return super().apply(inputs, timing_ctx)
 
     def _hf_processor_applies_updates(
         self,
@@ -874,7 +867,7 @@ class SiglipVisionModel(nn.Module):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             require_post_norm=require_post_norm,
-            prefix=f"{prefix}.vision_model",
+            prefix=maybe_prefix(prefix, "vision_model"),
             use_head=use_head,
         )
 
@@ -959,36 +952,10 @@ class SiglipVisionModel(nn.Module):
                 break
             else:
                 param = params_dict[name]
-                param = maybe_swap_ffn_param(
-                    name, param, loaded_weight, params_dict, self.quant_config
-                )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-def maybe_swap_ffn_param(
-    name: str,
-    param: torch.Tensor,
-    loaded_weight: torch.Tensor,
-    params_dict: dict[str, torch.Tensor],
-    quant_config: QuantizationConfig,
-) -> torch.Tensor:
-    if not (quant_config and quant_config.get_name() == "gguf") or ".fc" not in name:
-        return param
-    # Some GGUF models have fc1 and fc2 weights swapped
-    tp_size = get_tensor_model_parallel_world_size()
-    output_dim = getattr(param, "output_dim", 0)
-    output_size = param.size(output_dim) * tp_size
-    weight_out_size = loaded_weight.size(output_dim)
-    if ".fc1." in name and output_size != weight_out_size:
-        new_name = name.replace(".fc1.", ".fc2.")
-        param = params_dict[new_name]
-    elif ".fc2." in name and output_size != weight_out_size:
-        new_name = name.replace(".fc2.", ".fc1.")
-        param = params_dict[new_name]
-    return param
 
 
 # Adapted from: https://github.com/huggingface/transformers/blob/v4.54.1/src/transformers/models/siglip/modeling_siglip.py#L200
@@ -1190,13 +1157,11 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
         embed_input_ids: Callable[[torch.Tensor], torch.Tensor],
         *,
         is_multimodal: torch.Tensor | None,
-        handle_oov_mm_token: bool,
     ) -> torch.Tensor:
         inputs_embeds = super()._embed_text_input_ids(
             input_ids,
             embed_input_ids,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         # NOTE: inputs_embeds in model runner has size text_config.projection_size
@@ -1225,7 +1190,6 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         self._is_text_input = (
             multimodal_embeddings is None or len(multimodal_embeddings) == 0
@@ -1238,7 +1202,6 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:

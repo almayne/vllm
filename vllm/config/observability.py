@@ -59,7 +59,7 @@ class ObservabilityConfig:
 
     enable_layerwise_nvtx_tracing: bool = False
     """Enable layerwise NVTX tracing. This traces the execution of each layer or
-    module in the model and attach informations such as input/output shapes to
+    module in the model and attach information such as input/output shapes to
     nvtx range markers. Noted that this doesn't work with CUDA graphs enabled."""
 
     enable_mfu_metrics: bool = False
@@ -75,6 +75,10 @@ class ObservabilityConfig:
     If set, vllm EngineCore will log iteration details
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
+
+    jit_monitor_verbose: bool = False
+    """Log every Triton JIT compile with its dispatch key. This can emit many
+    logs and add overhead, so it is intended for debugging."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:

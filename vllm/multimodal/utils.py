@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import bisect
 import mimetypes
-import warnings
 from collections import defaultdict
 from collections.abc import Generator, Sequence
 from itertools import groupby
@@ -11,15 +11,17 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 from PIL import Image
+from typing_extensions import deprecated
 
+from vllm.inputs import MultiModalPlaceholders
 from vllm.utils.import_utils import LazyLoader
 
 from .hasher import MultiModalHasher
 from .inputs import (
     BatchedTensorInputs,
+    MultiModalFeatureSpec,
     MultiModalFieldElem,
     MultiModalKwargsItem,
-    MultiModalPlaceholderDict,
     MultiModalSharedField,
 )
 from .media import AudioMediaIO, ImageMediaIO, MediaConnector, VideoMediaIO
@@ -28,23 +30,6 @@ if TYPE_CHECKING:
     import torch.types
 else:
     torch = LazyLoader("torch", globals(), "torch")
-
-
-def __getattr__(name: str):
-    if name == "MEDIA_CONNECTOR_REGISTRY":
-        from .media import MEDIA_CONNECTOR_REGISTRY
-
-        warnings.warn(
-            "`vllm.multimodal.utils.MEDIA_CONNECTOR_REGISTRY` "
-            "has been moved to `vllm.multimodal.media.MEDIA_CONNECTOR_REGISTRY`. "
-            "The old name will be removed in v0.17.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        return MEDIA_CONNECTOR_REGISTRY
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def encode_audio_base64(
@@ -126,11 +111,34 @@ def encode_video_url(
     return f"data:{mimetype};base64,{video_b64}"
 
 
+def get_mm_features_in_window(
+    mm_features: list[MultiModalFeatureSpec],
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Return (lo, hi) indices for features overlapping [start, end).
+
+    Assumes mm_features are sorted by offset and non-overlapping, so
+    offset + length is also sorted.
+    """
+    lo = bisect.bisect_left(
+        mm_features,
+        start + 1,
+        key=lambda f: f.mm_position.offset + f.mm_position.length,
+    )
+    hi = bisect.bisect_left(
+        mm_features,
+        end,
+        key=lambda f: f.mm_position.offset,
+    )
+    return lo, hi
+
+
 def argsort_mm_positions(
-    mm_positions: MultiModalPlaceholderDict,
+    mm_positions: MultiModalPlaceholders,
 ) -> list[tuple[str, int]]:
     """
-    Given a `MultiModalPlaceholderDict`, output a sequence of keys to
+    Given a `MultiModalPlaceholders`, output a sequence of keys to
     sort the dictionary by `offset` (starting index in the input sequence)
     in ascending order.
 
@@ -225,7 +233,7 @@ def group_and_batch_mm_items(
     assert start_idx == len(items)
 
 
-def group_mm_kwargs_by_modality(
+def group_and_batch_mm_kwargs(
     mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
     *,
     device: torch.types.Device = None,
@@ -262,6 +270,19 @@ def group_mm_kwargs_by_modality(
             pin_memory=pin_memory,
         ):
             yield modality, num_items, mm_kwargs_batch
+
+
+@deprecated(
+    "`group_mm_kwargs_by_modality` has been renamed to `group_and_batch_mm_kwargs`. "
+    "The old name will be removed in v0.19."
+)
+def group_mm_kwargs_by_modality(
+    mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
+    *,
+    device: torch.types.Device = None,
+    pin_memory: bool = False,
+) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
+    return group_and_batch_mm_kwargs(mm_kwargs, device=device, pin_memory=pin_memory)
 
 
 def fetch_audio(

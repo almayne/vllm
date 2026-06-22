@@ -83,13 +83,13 @@ based on assigned priority, with FCFS as a tie-breaker), configurable via the
 
 ### Hardware
 
-| Hardware         | Status                                        |
-|------------------|-----------------------------------------------|
-| **NVIDIA**       | <nobr>🟢</nobr>                               |
-| **AMD**          | <nobr>🟢</nobr>                               |
-| **INTEL GPU**    | <nobr>🟢</nobr>                               |
-| **TPU**          | <nobr>🟢</nobr>                               |
-| **CPU**          | <nobr>🟢</nobr>                               |
+| Hardware      | Status          |
+| --------------| --------------- |
+| **NVIDIA**    | <nobr>🟢</nobr> |
+| **AMD**       | <nobr>🟢</nobr> |
+| **INTEL GPU** | <nobr>🟢</nobr> |
+| **TPU**       | <nobr>🟢</nobr> |
+| **CPU**       | <nobr>🟢</nobr> |
 
 !!! note
 
@@ -104,13 +104,13 @@ based on assigned priority, with FCFS as a tie-breaker), configurable via the
 
 ### Models
 
-| Model Type                  | Status                                                                  |
-|-----------------------------|-------------------------------------------------------------------------|
-| **Decoder-only Models**     | <nobr>🟢</nobr>                                                         |
-| **Encoder-Decoder Models**  | <nobr>🟢 (Whisper), 🔴 (Others) </nobr>                                |
-| **Pooling Models**          | <nobr>🟢</nobr>                                                         |
-| **Mamba Models**            | <nobr>🟢</nobr>                                                         |
-| **Multimodal Models**       | <nobr>🟢</nobr>                                                         |
+| Model Type                 | Status                                  |
+| -------------------------- | --------------------------------------- |
+| **Decoder-only Models**    | <nobr>🟢</nobr>                         |
+| **Encoder-Decoder Models** | <nobr>🟢 (Whisper), 🔴 (Others) </nobr> |
+| **Pooling Models**         | <nobr>🟢</nobr>                         |
+| **Mamba Models**           | <nobr>🟢</nobr>                         |
+| **Multimodal Models**      | <nobr>🟢</nobr>                         |
 
 See below for the status of models that are not yet supported or have more features planned in V1.
 
@@ -128,7 +128,7 @@ Models that use Mamba-2 and Mamba-1 layers (e.g., `Mamba2ForCausalLM`, `MambaFor
 Hybrid models that combine Mamba-2 and Mamba-1 layers with standard attention layers are also supported (e.g., `BambaForCausalLM`,
 `Zamba2ForCausalLM`, `NemotronHForCausalLM`, `FalconH1ForCausalLM` and `GraniteMoeHybridForCausalLM`, `JambaForCausalLM`, `Plamo2ForCausalLM`).
 
-Hybrid models with mechanisms different to Mamba are also supported (e.g, `MiniMaxText01ForCausalLM`, `MiniMaxM1ForCausalLM`, `Lfm2ForCausalLM`).
+Hybrid models with mechanisms different to Mamba are also supported (e.g, `Lfm2ForCausalLM`).
 
 Please note that prefix caching is not yet supported for any of the above models.
 
@@ -145,7 +145,7 @@ following a similar pattern by implementing support through the [plugin system](
 ### Features
 
 | Feature                                     | Status                                                                            |
-|---------------------------------------------|-----------------------------------------------------------------------------------|
+| ------------------------------------------- | --------------------------------------------------------------------------------- |
 | **Prefix Caching**                          | <nobr>🟢 Functional</nobr>                                                        |
 | **Chunked Prefill**                         | <nobr>🟢 Functional</nobr>                                                        |
 | **LoRA**                                    | <nobr>🟢 Functional</nobr>                                                        |

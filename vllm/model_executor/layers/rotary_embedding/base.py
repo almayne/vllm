@@ -47,15 +47,31 @@ class RotaryEmbeddingBase(CustomOp):
         if not hasattr(self, "use_flashinfer"):
             self.use_flashinfer = False
 
+        self.use_aiter = (
+            self.enabled() and rocm_aiter_ops.is_triton_rotary_embed_enabled()
+        )
+        if self.use_aiter:
+            self.rocm_aiter_triton_rotary_embedding = (
+                rocm_aiter_ops.get_triton_rotary_embedding_op()
+            )
+
         if init_cache:
             cache = self._compute_cos_sin_cache()
             if not self.use_flashinfer:
                 cache = cache.to(dtype)
             self.cos_sin_cache: torch.Tensor
             self.register_buffer("cos_sin_cache", cache, persistent=False)
-        self.is_rocm_triton_rotary_embed_enabled = (
-            rocm_aiter_ops.is_triton_rotary_embed_enabled()
-        )
+
+            # Reuse a precomputed bf16 cache for the AITER compile path.
+            if self.use_aiter and cache.dtype != torch.bfloat16:
+                self.cos_sin_cache_bf16: torch.Tensor | None
+                self.register_buffer(
+                    "cos_sin_cache_bf16",
+                    cache.to(torch.bfloat16),
+                    persistent=False,
+                )
+            else:
+                self.cos_sin_cache_bf16 = None
 
         self.apply_rotary_emb = ApplyRotaryEmb(
             is_neox_style=self.is_neox_style,
@@ -95,6 +111,16 @@ class RotaryEmbeddingBase(CustomOp):
             and self.cos_sin_cache.dtype == query.dtype
         ):
             return cos_sin_cache
+
+        # Reuse precomputed bf16 cache in the AITER compile path.
+        if (
+            self.use_aiter
+            and torch.compiler.is_compiling()
+            and query.dtype == torch.bfloat16
+        ):
+            cache_bf16 = getattr(self, "cos_sin_cache_bf16", None)
+            if cache_bf16 is not None and cache_bf16.device == query.device:
+                return cache_bf16
 
         cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
@@ -231,15 +257,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.is_rocm_triton_rotary_embed_enabled:
+        if self.use_aiter:
             cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-            rocm_aiter_ops.triton_rotary_embed(
+            self.rocm_aiter_triton_rotary_embedding(
                 positions,
                 query,
                 key,
-                cos_sin_cache,
                 self.head_size,
-                self.rotary_dim,
+                cos_sin_cache,
                 self.is_neox_style,
             )
             return query, key

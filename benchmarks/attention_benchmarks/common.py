@@ -10,11 +10,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from batch_spec import get_batch_type, parse_batch_spec
 from rich.console import Console
 from rich.table import Table
+
+from vllm.triton_utils import triton
 
 
 def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
@@ -31,8 +32,32 @@ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
         max_kv_len = max(r.kv_len for r in requests) if requests else 0
         return (batch_size, max_q_len, max_kv_len)
     except Exception:
-        # Fallback for unparseable specs
+        # Fallback for unparsable specs
         return (0, 0, 0)
+
+
+def run_do_bench(
+    benchmark_fn,
+    use_cuda_graphs: bool,
+    warmup_ms: int | None = None,
+) -> list[float]:
+    kwargs: dict[str, Any] = {"return_mode": "all"}
+    if use_cuda_graphs:
+        result = triton.testing.do_bench_cudagraph(benchmark_fn, **kwargs)
+    else:
+        if warmup_ms is not None:
+            kwargs["warmup"] = warmup_ms
+        result = triton.testing.do_bench(benchmark_fn, **kwargs)
+    return result
+
+
+def run_ncu_profile(benchmark_fn) -> None:
+    benchmark_fn()
+    torch.accelerator.synchronize()
+    torch.cuda.cudart().cudaProfilerStart()
+    benchmark_fn()
+    torch.accelerator.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 # Mock classes for vLLM attention infrastructure
@@ -62,10 +87,7 @@ class MockHfConfig:
 # Import AttentionLayerBase at module level to avoid circular dependencies
 try:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
-    _HAS_ATTENTION_LAYER_BASE = True
 except ImportError:
-    _HAS_ATTENTION_LAYER_BASE = False
     AttentionLayerBase = object  # Fallback
 
 
@@ -81,6 +103,7 @@ class MockKVBProj:
         self.qk_nope_head_dim = qk_nope_head_dim
         self.v_head_dim = v_head_dim
         self.out_dim = qk_nope_head_dim + v_head_dim
+        self.weight = torch.empty(0, dtype=torch.bfloat16)
 
     def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor]:
         """
@@ -167,95 +190,6 @@ class MockLayer(AttentionLayerBase):
         return self._kv_cache_spec
 
 
-class MockModelConfig:
-    """Mock model configuration."""
-
-    def __init__(
-        self,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype = torch.float16,
-        max_model_len: int = 32768,
-    ):
-        self._n_q = num_q_heads
-        self._n_kv = num_kv_heads
-        self._d = head_dim
-        self.dtype = dtype
-        self.max_model_len = max_model_len
-
-    def get_num_attention_heads(self, _=None) -> int:
-        return self._n_q
-
-    def get_num_kv_heads(self, _=None) -> int:
-        return self._n_kv
-
-    def get_head_size(self) -> int:
-        return self._d
-
-    def get_num_layers(self) -> int:
-        """Mock method for layer count queries."""
-        return 1
-
-    def get_sliding_window_for_layer(self, _layer_idx: int):
-        """Mock method for sliding window queries."""
-        return None
-
-    def get_logits_soft_cap_for_layer(self, _layer_idx: int):
-        """Mock method for logits soft cap queries."""
-        return None
-
-    def get_sm_scale_for_layer(self, _layer_idx: int) -> float:
-        """Mock method for SM scale queries."""
-        return 1.0 / (self.get_head_size() ** 0.5)
-
-
-class MockParallelConfig:
-    """Mock parallel configuration."""
-
-    pass
-
-
-class MockCompilationConfig:
-    """Mock compilation configuration."""
-
-    def __init__(self):
-        self.full_cuda_graph = False
-        self.static_forward_context = {}
-
-
-class MockVLLMConfig:
-    """Mock VLLM configuration."""
-
-    def __init__(self):
-        self.compilation_config = MockCompilationConfig()
-
-
-class MockRunner:
-    """Mock GPU runner for metadata builders."""
-
-    def __init__(
-        self,
-        seq_lens: np.ndarray,
-        query_start_locs: np.ndarray,
-        device: torch.device,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-    ):
-        self.model_config = MockModelConfig(num_q_heads, num_kv_heads, head_dim, dtype)
-        self.parallel_config = MockParallelConfig()
-        self.vllm_config = MockVLLMConfig()
-        self.seq_lens_np = seq_lens
-        self.query_start_loc_np = query_start_locs
-        self.device = device
-        self.attention_chunk_size = None
-        self.num_query_heads = num_q_heads
-        self.num_kv_heads = num_kv_heads
-        self.dtype = dtype
-
-
 @dataclass
 class ParameterSweep:
     """Configuration for sweeping a backend parameter."""
@@ -274,17 +208,36 @@ class ParameterSweep:
 
 @dataclass
 class ModelParameterSweep:
-    """Configuration for sweeping a model configuration parameter."""
+    """Configuration for sweeping model configuration parameter(s).
 
-    param_name: str  # Name of the model config parameter to sweep (e.g., "num_q_heads")
-    values: list[Any]  # List of values to test
-    label_format: str = "{backend}_{param_name}_{value}"  # Result label template
+    Supports two modes:
+    - Single param: param_name="head_dim", values=[128, 256, 512]
+    - Multi param: values=[{head_dim: 192, v_head_dim: 128}, {head_dim: 256}]
+      When values are dicts, each dict's keys are applied as config overrides.
+    """
+
+    param_name: str | None = None
+    values: list[Any] | None = None
+    label_format: str = "{backend}_{param_name}_{value}"
 
     def get_label(self, backend: str, value: Any) -> str:
         """Generate a label for a specific parameter value."""
+        if isinstance(value, dict):
+            return self.label_format.format(
+                backend=backend, param_name=self.param_name, value=value, **value
+            )
         return self.label_format.format(
             backend=backend, param_name=self.param_name, value=value
         )
+
+    def apply(self, config_args: dict, value: Any) -> None:
+        """Apply a sweep value to config args."""
+        if isinstance(value, dict):
+            config_args.update(value)
+        elif self.param_name is not None:
+            config_args[self.param_name] = value
+        else:
+            raise ValueError("param_name must be set if sweep values are not dicts")
 
 
 @dataclass
@@ -300,12 +253,16 @@ class BenchmarkConfig:
     block_size: int
     device: str
     dtype: torch.dtype = torch.float16
-    repeats: int = 1
-    warmup_iters: int = 3
     profile_memory: bool = False
     use_cuda_graphs: bool = False
+    ncu_profile: bool = False
+    warmup_ms: int | None = None
+
+    # "auto" or "fp8"
+    kv_cache_dtype: str = "auto"
 
     # MLA-specific
+    prefill_backend: str | None = None
     kv_lora_rank: int | None = None
     qk_nope_head_dim: int | None = None
     qk_rope_head_dim: int | None = None
@@ -314,6 +271,7 @@ class BenchmarkConfig:
     # Backend-specific tuning
     num_kv_splits: int | None = None  # CUTLASS MLA
     reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA
+    num_splits: int | None = None  # FlashAttention split-K (0=auto, 1=disabled)
 
 
 @dataclass
@@ -322,6 +280,7 @@ class BenchmarkResult:
 
     config: BenchmarkConfig
     mean_time: float  # seconds
+    median_time: float  # seconds
     std_time: float  # seconds
     min_time: float  # seconds
     max_time: float  # seconds
@@ -340,6 +299,7 @@ class BenchmarkResult:
         return {
             "config": asdict(self.config),
             "mean_time": self.mean_time,
+            "median_time": self.median_time,
             "std_time": self.std_time,
             "min_time": self.min_time,
             "max_time": self.max_time,
@@ -460,6 +420,7 @@ class ResultsFormatter:
                     "backend",
                     "batch_spec",
                     "num_layers",
+                    "kv_cache_dtype",
                     "mean_time",
                     "std_time",
                     "throughput",
@@ -473,6 +434,7 @@ class ResultsFormatter:
                         "backend": r.config.backend,
                         "batch_spec": r.config.batch_spec,
                         "num_layers": r.config.num_layers,
+                        "kv_cache_dtype": r.config.kv_cache_dtype,
                         "mean_time": r.mean_time,
                         "std_time": r.std_time,
                         "throughput": r.throughput_tokens_per_sec or 0,

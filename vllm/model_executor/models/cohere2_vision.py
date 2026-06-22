@@ -19,16 +19,16 @@ from transformers.models.cohere2_vision.processing_cohere2_vision import (
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import MulAndSilu
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -44,7 +44,12 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsQuant,
+)
 from .siglip import SiglipVisionModel
 from .utils import (
     AutoWeightsLoader,
@@ -197,13 +202,12 @@ class Cohere2VisionDummyInputsBuilder(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-        mm_processor_kwargs: Mapping[str, object] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
         image_size = self.info.get_image_size_with_most_features()
 
-        image_overrides = mm_options.get("image") if mm_options else None
+        image_overrides = mm_options.get("image")
 
         return {
             "image": self._get_dummy_images(
@@ -310,15 +314,21 @@ class Cohere2VisionMultiModalProcessor(
     info=Cohere2VisionProcessingInfo,
     dummy_inputs=Cohere2VisionDummyInputsBuilder,
 )
-class Cohere2VisionForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class Cohere2VisionForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant
+):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.vision_tower.": "vision_tower.",
             "model.multi_modal_projector.": "multi_modal_projector.",
             "model.language_model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
         }
     )
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -347,6 +357,10 @@ class Cohere2VisionForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 prefix=maybe_prefix(prefix, "language_model"),
                 architectures=config.text_config.architectures,
             )
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     @property
     def dtype(self):
@@ -406,7 +420,7 @@ class Cohere2VisionForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     ):
         # the awq models from OpenGVLab missing `modules_to_not_convert`
         # patch the quant_config to add `modules_to_not_convert` back
-        if isinstance(quant_config, AWQConfig):
+        if isinstance(quant_config, AutoAWQConfig):
             text_config = config.text_config
             llm_quant_config = getattr(text_config, "quantization_config", None)
             if (not quant_config.modules_to_not_convert) and (
